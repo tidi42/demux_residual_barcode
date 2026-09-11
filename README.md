@@ -1,10 +1,10 @@
 # Demultiplexing and Residual Barcode Analysis
 
-Calculation scripts for comparing Dorado and Barbell preprocessing and for an exploratory barcode-to-database similarity screen.
+Calculation scripts for comparing Dorado and Barbell preprocessing, auditing complete-query barcode-reference matches, and checking detector sensitivity. The main experimental workflow uses ONT SQK-NBD114-96; the reference screen is a focused case study, not a general database-contamination census or cross-platform benchmark.
 
 ## Privacy and Repository Contents
 
-This repository contains calculation/pipeline scripts and this README only. It contains no sequencing inputs, donor or sample records, read identifiers, per-experiment measurements, analysis results, manuscript files or reviews. Users supply their own data and barcode definitions locally.
+This repository contains calculation/pipeline scripts, regression tests and this README only. It contains no sequencing inputs, donor or sample records, read identifiers, per-experiment measurements, result tables, taxonomy responses, manuscript files or reviews. Users supply their own data and barcode definitions locally.
 
 The pipeline can produce sensitive intermediate files, including FASTQ output, read-level SQLite databases, examples of problematic reads and per-experiment reports. Those local outputs are **not approved for publication** merely because the code is public. Keep them outside Git and follow the applicable data-privacy policy. Do not use `git add .` in a directory containing study data.
 
@@ -17,7 +17,7 @@ A separately distributed `supplementary_source_data.zip` can contain the same re
 - Barbell 0.3.2, samtools 1.19.2 and NanoStat 1.6.0 for the recorded preprocessing workflow. Supply executable paths when they are not on PATH.
 - ONT POD5 tooling if FAST5 conversion is needed; the pipeline takes POD5 input.
 - Optional BLAST+ (`blastn`, `blastdbcmd`) and a locally prepared nucleotide database for barcode screening.
-- Optional R with `tidyverse` for the two database-summary plotting scripts. These are plotting helpers, not GraphPad project files.
+- Optional R with `ggplot2`, `readr` and Cairo graphics support for the current GraphPad-style Figure 2 renderer. It generates PNG/PDF files, not GraphPad project files.
 - Optional minimap2 only for the legacy auxiliary barcode scan; it is not the approximate-regex endpoint described below.
 
 Use an isolated environment:
@@ -40,6 +40,8 @@ The supported CLI entry points provide `--help`. Test the external tools indepen
 | C6 | Barbell applied to the concatenated C3 output; a selected diagnostic subset |
 
 The release and basecalling model change together. C4/C5 are parallel alternatives to C2/C3, not sequential processing of them. C6 is not a matched whole-population comparator.
+
+In Barbell 0.3.2, `--maximize` selects additional accepted configuration patterns at the filter step after unchanged annotation. It does not increase barcode-search sensitivity or enable `--use-extended`. Retention and residual-pattern removal do not establish correct sample assignment or clinical safety.
 
 ## Pipeline
 
@@ -99,40 +101,95 @@ The primary inferential endpoint is the paired, experiment-level internal-match 
 
 ## Barcode-Database Screen
 
-The BLAST driver requires a user-supplied barcode CSV, output directory and database prefix:
+The BLAST driver requires a user-supplied barcode CSV, output directory and database prefix. If the raw exports already exist, start with the audit command; do not rerun the search unnecessarily.
 
 ```bash
 THREADS=8 bash scripts/run_barcode_core_nt_blast.sh \
   /path/to/barcodes.csv /path/to/local_blast_output /path/to/core_nt/core_nt
 
-.venv/bin/python scripts/make_fig2_graphpad_tables.py \
-  --barcode-hits /path/to/local_blast_output/barcodes_only_blast_raw.tsv \
-  --motif-hits /path/to/local_blast_output/barcodes_with_ont_adapter_blast_raw.tsv \
-  --out figures/fig2
-
-.venv/bin/python scripts/keyword_precedence_sensitivity.py \
-  --barcode-hits /path/to/local_blast_output/barcodes_only_blast_raw.tsv \
-  --motif-hits /path/to/local_blast_output/barcodes_with_ont_adapter_blast_raw.tsv
+.venv/bin/python scripts/audit_complete_blast.py \
+  --barcode-only /path/to/local_blast_output/barcodes_only_blast_raw.tsv \
+  --motif-barcode /path/to/local_blast_output/barcodes_with_ont_adapter_blast_raw.tsv \
+  --out /path/to/audited_figure2
 ```
 
-The table generator writes complete HSP-count, subject/title-group and record-annotation tables. Optional R helpers take the table directory as their first argument:
+The audit requires `pident = 100`, `mismatch = 0`, `gapopen = 0`, query endpoints spanning 1 to `qlen`, alignment length equal to `qlen`, and an ungapped subject span of the same length. Query length and subject coordinates must be positive. `qcovs` is subject-level coverage and is not proof of individual-HSP completeness. Raw exports use the 17-column schema defined in the audit script.
+
+Distinct barcode-accession pairs are primary; HSPs are secondary. Grouping retains exported TaxIDs rather than parsing names from record titles. Record-title categories do not independently establish the function or biological origin of a matched interval. The audit writes detailed local HSP/accession working tables as well as aggregate plot tables; keep the detailed outputs out of Git.
+
+### Taxonomy and GraphPad-Style Figure 2
+
+Map exported TaxIDs to NCBI Taxonomy scientific names, ranks and lineages, then render:
 
 ```bash
-Rscript scripts/barbell_figure2a_shared_vulnerability_bubble.R figures/fig2
-Rscript scripts/barbell_figure2b_fp_risk.R figures/fig2
+.venv/bin/python scripts/map_figure2_taxonomy.py \
+  --input /path/to/audited_figure2/Fig2A_taxid_groups.csv \
+  --out /path/to/audited_figure2 --cache /path/to/taxonomy_cache
+
+Rscript scripts/plot_audited_figure2_graphpad.R \
+  --data /path/to/audited_figure2 --out /path/to/rendered_figure2
 ```
 
-The motif panel prefixes `TTTCTGTTGGTGCTGATATTGCT` separately to the forward barcode and its reverse complement. It is not a complete native ligation construct and its reverse complement. BLAST already searches both strands. The driver's top-ten exports are capped; the complete-table generator instead reads the raw BLAST output.
+The first mapping call sends only the TaxIDs to NCBI. Subsequent calls reuse the exact cached XML and request metadata when available, checking its checksum. Missing/duplicate mappings fail explicitly; aliases are recorded without merging the original exported groups. Names and ranks are current NCBI annotations, not independent biological validation or a reconstruction of taxonomy at the BLAST database-build date. Informational species-ancestor columns are not used for regrouping.
+
+The current R renderer preserves the GraphPad-style axes, typography and palette, with named/ranked TaxID labels and connector lines in panel A, accession counts in B, and a composition table in C. It is a study-specific reproduction script: expected totals and selected label positions are deliberately checked. For another dataset, use the general audit/mapping outputs and adapt the figure assertions and layout deliberately. The author's separately assembled Prism stacked panel C is not recreated by this table-C renderer.
+
+The previous Python renderer remains for historical reproduction of the unnamed layout. The superseded title-parsing/risk-class Figure 2 helpers have been retired; use the strict audit and named R renderer for the corrected workflow.
+
+The motif panel prefixes `TTTCTGTTGGTGCTGATATTGCT` separately to the forward barcode and its reverse complement. It is not a complete native ligation construct and its reverse complement. BLAST already searches both strands. The driver's top-ten exports are capped; the strict audit reads all raw exported rows. Differences between query constructions do not isolate adapter context from length or establish suppression of biological cross-reactivity.
+
+## Pooled Read-Length and Yield Tables
+
+Use the integer length-bin exports from all experiments and the saved yield summary:
+
+```bash
+.venv/bin/python scripts/make_s1_prism_tables.py \
+  --bins /path/to/experiment_a/length_distribution_bins.csv \
+         /path/to/experiment_b/length_distribution_bins.csv \
+  --yield-summary /path/to/summary_a_read_yield.csv \
+  --out /path/to/figureS1_tables
+```
+
+Supply every experiment's bin file, not just the two illustrative paths. The exporter reconciles bin totals with yields and writes mean/SD/N yield summaries, pooled counts/percentages and density-format XY tables. Unequal-width bins need density for a continuous histogram; the open-ended overflow bin has no defined width. Aggregate mean/SD/N cannot recreate individual experiment symbols. Logarithmic axis formatting does not change the underlying percentages or their denominators.
+
+## Bounded Detector Validation
+
+The occurrence-enumerating detector is a separate validation tool; it does not replace the original production scanner. It retains the original edit budget, checks candidate spans and resolves overlaps with a deterministic greedy policy. Adjacent intervals are retained; ambiguous positive-length overlaps are rejected.
+
+```bash
+.venv/bin/python scripts/validate_detector_occurrences.py \
+  --barcode-csv /path/to/barcodes.csv \
+  --experiments /path/to/experiment_a_demux /path/to/experiment_b_demux \
+  --samples-per-condition 64 --windows 40 80 120 --seed 20260911 \
+  --synthetic --out /path/to/private_validation
+
+.venv/bin/python scripts/summarize_detector_validation.py \
+  --source /path/to/private_validation --out /path/to/aggregate_validation
+```
+
+Supply all intended experiment directories. Each must contain the condition output folders expected by the CLI; include only actual output FASTQs, not duplicated input/merged intermediate files. Sampling is bounded, restricted to reads shorter than 5,000 bp and paired by experiment, not read ID. The random-byte proposal uses approximate inverse-record-span weighting. Synthetic-only validation is available by omitting `--experiments`.
+
+The aggregate exporter separates study-pilot, experiment-paired, synthetic-recovery and synthetic-background summaries. These are not replacements for full-study length distributions or residual-rate estimates. Model backgrounds and mononucleotide shuffles are not matched biological barcode-free controls; zero observed events do not demonstrate zero background, equal sensitivity or rare-event precision. Files labelled `_LOCAL` and all sequences/identifiers must remain private.
+
+## Tests
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m unittest discover -s scripts/tests -v
+```
+
+The 20 tests cover strict HSP criteria, taxonomy parsing/alias and failure handling, and occurrence-detector behaviour including comparison with the production best-hit arm. They do not require study reads, a BLAST database or network taxonomy access.
 
 ## Measurement Limits and Release Notes
 
 - The regex budget is at most one substitution, one insertion and one deletion per barcode, not any three edits. One best match is retained per barcode orientation. Repeated copies are not exhaustively enumerated; a terminal best match can hide an internal copy, and one short-read match can satisfy both terminal-window tests.
 - Condition-level record ratios, barcode-ID multiplicity and location summaries are detector-defined endpoints, not calibrated sample-crosstalk or clinical false-positive rates.
-- The historical BLAST filter is `mismatch = 0`, `pident = 100`, `qcovs = 100`. `qcovs` is query coverage per subject across HSPs, not the span of an individual HSP. No full-query validation or new alignment totals are implied by this release.
+- The strict per-HSP audit supersedes the historical `qcovs`-based filter. The legacy BLAST driver's convenience summaries are not substitutes for the audited outputs.
 - The legacy `write_stat_tests` branch in the scanner queries `dorado`/`barbell` labels. Its output is not a valid pairwise-test table for the c0-c6 design. Use the separate paired experiment-level analysis; the legacy branch was not silently redefined for the published comparison.
 - `stat_mean` length-bin summaries are unweighted experiment means. Pooled percentages require weighting by each condition's output read counts. Geometric summaries are not additive.
-- Title parsing and keyword precedence yield descriptive database-record groups/categories, not independent taxonomic or functional validation.
+- Barcode-like sequences in experimental reads and matching kit barcode sequences in references are complementary observations. They do not establish that the residual reads caused false taxonomic assignments or generated the surveyed reference records.
+- NCBI name/rank annotation does not turn mixed-rank bacterial, eukaryotic and viral groups into a bacteria-only species census; title-keyword categories do not establish interval function.
 
-This release makes executable paths and experiment lists configurable, builds the complete database-summary tables from explicit inputs, and removes fixed study-total assertions. The regex detector and operational BLAST-filter rules are unchanged. Python/R/shell syntax and CLI entry points were checked; synthetic tests covered detector equivalence, paired statistics, HSP filtering/de-duplication and percentage-table totals. Full basecalling, BLAST searches and private-study recomputation were not run during release preparation. The tested environment is not asserted to be an export of the historical production environment.
+This update publishes the portable scripts and tests from the current supplementary code payload, including the strict audit, pooled figure tables, detector pilot, verified taxonomy mapping and connector-line GraphPad renderer. The existing production scanner remains unchanged. No sequencing, full-study rescan, new BLAST search or clinical classification was run during publication preparation. The tested environment is not asserted to reproduce the exact historical production environment.
 
 For a reproducible citation, record the Git commit used and cite the Zenodo **version DOI** after the matching release has been archived. A concept DOI does not pin a specific release.
