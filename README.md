@@ -77,6 +77,8 @@ For already prepared FASTQs, the scanner can be invoked directly:
 
 Here `--skip-barcode-scan` skips the legacy **minimap2** auxiliary scan, not the regex endpoint. The regex scan is enabled by `--barcode-csv`; omitting that CSV skips residual-pattern detection. Choose a new output directory for a new analysis. `--overwrite` replaces an existing comparison database and should be used only deliberately.
 
+Residual barcodes are detected with `--detector occurrences` by default (see [Residual Barcode Detector](#residual-barcode-detector)). `barbell_paper.py` passes the same `--detector` option to the scanner.
+
 ## Aggregation and Paired Statistics
 
 The local directory pattern is `outputs/{experiment}_demux/cmp_all/`. Supply the experiment names explicitly; the examples below are placeholders, not subject identifiers.
@@ -94,6 +96,8 @@ The local directory pattern is `outputs/{experiment}_demux/cmp_all/`. Supply the
   --base-dir outputs --experiments experiment_a experiment_b \
   --out figures/summary_figures/graphpad
 ```
+
+`barbell_figure_f_paired.py` and `make_barcode_multiplicity_csvs.py` take `--cmp-subdir` for a comparison folder other than `cmp_all`, so a rerun kept in a separate tree (for example `--base-dir outputs_occurrences`) can be aggregated the same way. `barbell_figure_f_paired.py --rescan-csvs` recomputes the paired tests from the corrected internal rates of `rescan_masked_internal.py`. `make_graphpad_fig1e_table.py` writes the per-experiment barcode-positive table from `summary_e_barcode_pct.csv`.
 
 `barbell_figures.py` generates per-condition summaries from one comparison database. `barbell_figure_f_violin.py` calculates location-rate summaries and optional rarefaction displays from supplied experiment directories. `make_summary_f_log.py` takes `--input`, `--experiments` and `--out` to generate log-scale location summaries. Their generated replicate-level files are local analysis outputs, not privacy-filtered publication data.
 
@@ -152,9 +156,31 @@ Use the integer length-bin exports from all experiments and the saved yield summ
 
 Supply every experiment's bin file, not just the two illustrative paths. The exporter reconciles bin totals with yields and writes mean/SD/N yield summaries, pooled counts/percentages and density-format XY tables. Unequal-width bins need density for a continuous histogram; the open-ended overflow bin has no defined width. Aggregate mean/SD/N cannot recreate individual experiment symbols. Logarithmic axis formatting does not change the underlying percentages or their denominators.
 
+## Residual Barcode Detector
+
+Each barcode orientation is compiled as `(SEQUENCE){s<=1,i<=1,d<=1}` with the Python `regex` package. `compare_dorado_barbell_outputs.py --detector` selects how matches are collected; the edit budget, the 80 bp terminal window, the location classes and their priority (internal > both-ends > terminal) and the SQLite schema are the same for both detectors.
+
+- `--detector occurrences` (default): `OccurrenceScanner` from `validate_detector_occurrences.py` enumerates every candidate occurrence. Exact 6 nt seeds propose starts, each 23-25 nt span is confirmed with `fullmatch`, and overlapping candidates across all patterns are resolved greedily by edit distance, deviation from 24 nt, start, end, barcode number and orientation. Adjacent matches are kept. `residual_count` is the number of non-overlapping occurrences.
+- `--detector best_hit`: one `pattern.search` per barcode orientation (regex BESTMATCH), i.e. the copy with the fewest edits, ties resolved to the most 5' copy. It cannot enumerate repeated copies of one orientation, and a terminal best match can hide an internal copy of the same orientation. Use it only to reproduce runs made before the `--detector` option; `residual_count` is then the number of retained patterns.
+
+A read has a best-hit match if and only if it has at least one occurrence, so barcode-positive fractions are identical under both detectors. Each output directory records `detector_provenance.json` (detector, scanner SHA-256, regex version, edit budget, terminal window); the scanner refuses to resume into a database made with different settings, and databases without the file are treated as best-hit.
+
+`--decoys N` also scans every read against N decoy barcode sets, in which the bases of each forward barcode are shuffled (composition preserved) and the backward decoy is the reverse complement of the shuffled forward. Decoy matches are located and classified like real ones and summarised in `decoy_background.csv`. This multiplies scan time; `--decoy-seed` fixes the shuffles.
+
+An existing best-hit database can be corrected without a full rescan. Only reads with a best-hit match can hide an internal copy, so `rescan_masked_internal.py` rechecks just those reads with the occurrence detector, reads the database read-only and writes per-condition counts:
+
+```bash
+.venv/bin/python scripts/rescan_masked_internal.py \
+  --db outputs/experiment_a_demux/cmp_all/comparison.sqlite \
+  --barcode-csv /path/to/barcodes.csv --experiment experiment_a \
+  --out /path/to/rescan/experiment_a_rescan_masked_internal.csv --threads 8
+```
+
+`--path-map OLD=NEW` remaps FASTQ paths stored in the database if the data have moved. Its corrected internal counts equal those of a full `--detector occurrences` rescan of the same FASTQs. `--reclassified-out` lists read identifiers for local inspection only; keep that file private. `compare_detector_runs.py --old-base outputs --new-base outputs_occurrences --experiments ...` writes a Markdown old-versus-new report; it contains study results and belongs with the local outputs, not in Git.
+
 ## Bounded Detector Validation
 
-The occurrence-enumerating detector is a separate validation tool; it does not replace the original production scanner. It retains the original edit budget, checks candidate spans and resolves overlaps with a deterministic greedy policy. Adjacent intervals are retained; ambiguous positive-length overlaps are rejected.
+`validate_detector_occurrences.py` also provides the bounded pilot and synthetic controls used to validate the occurrence detector before it became the default. It retains the original edit budget, checks candidate spans and resolves overlaps with the same deterministic greedy policy. Adjacent intervals are retained; ambiguous positive-length overlaps are rejected.
 
 ```bash
 .venv/bin/python scripts/validate_detector_occurrences.py \
@@ -178,11 +204,11 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
   .venv/bin/python -m unittest discover -s scripts/tests -v
 ```
 
-The 20 tests cover strict HSP criteria, taxonomy parsing/alias and failure handling, and occurrence-detector behaviour including comparison with the production best-hit arm. They do not require study reads, a BLAST database or network taxonomy access.
+The 29 tests cover strict HSP criteria, taxonomy parsing/alias and failure handling, occurrence-detector behaviour, synthetic reads that pin the best-hit and occurrence results of the production scanner (including the masked internal copies and the tie rule), the decoy sets, and the targeted rescan on a synthetic database. They do not require study reads, a BLAST database or network taxonomy access.
 
 ## Measurement Limits and Release Notes
 
-- The regex budget is at most one substitution, one insertion and one deletion per barcode, not any three edits. One best match is retained per barcode orientation. Repeated copies are not exhaustively enumerated; a terminal best match can hide an internal copy, and one short-read match can satisfy both terminal-window tests.
+- The regex budget is at most one substitution, one insertion and one deletion per barcode, not any three edits. The default occurrence detector enumerates non-overlapping occurrences under an operational overlap rule; it does not establish physical barcode copies. One short-read match can satisfy both terminal-window tests. Decoy barcodes estimate coincidental matching within the edit budget but are not matched biological barcode-free controls.
 - Condition-level record ratios, barcode-ID multiplicity and location summaries are detector-defined endpoints, not calibrated sample-crosstalk or clinical false-positive rates.
 - The strict per-HSP audit supersedes the historical `qcovs`-based filter. The legacy BLAST driver's convenience summaries are not substitutes for the audited outputs.
 - The legacy `write_stat_tests` branch in the scanner queries `dorado`/`barbell` labels. Its output is not a valid pairwise-test table for the c0-c6 design. Use the separate paired experiment-level analysis; the legacy branch was not silently redefined for the published comparison.
@@ -190,6 +216,6 @@ The 20 tests cover strict HSP criteria, taxonomy parsing/alias and failure handl
 - Barcode-like sequences in experimental reads and matching kit barcode sequences in references are complementary observations. They do not establish that the residual reads caused false taxonomic assignments or generated the surveyed reference records.
 - NCBI name/rank annotation does not turn mixed-rank bacterial, eukaryotic and viral groups into a bacteria-only species census; title-keyword categories do not establish interval function.
 
-This update publishes the portable scripts and tests from the current supplementary code payload, including the strict audit, pooled figure tables, detector pilot, verified taxonomy mapping and connector-line GraphPad renderer. The existing production scanner remains unchanged. No sequencing, full-study rescan, new BLAST search or clinical classification was run during publication preparation. The tested environment is not asserted to reproduce the exact historical production environment.
+This update publishes the portable scripts and tests from the current supplementary code payload. The production scanner now uses the occurrence detector by default, with `--detector best_hit` retained for earlier runs; the targeted rescan, detector-comparison and Fig. 1E table scripts and their tests are added. Earlier releases published the strict audit, pooled figure tables, detector pilot, verified taxonomy mapping and connector-line GraphPad renderer. No new sequencing, BLAST search or clinical classification was run during publication preparation. The tested environment is not asserted to reproduce the exact historical production environment.
 
 For a reproducible citation, record the Git commit used and cite the Zenodo **version DOI** after the matching release has been archived. A concept DOI does not pin a specific release.

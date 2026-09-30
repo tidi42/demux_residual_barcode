@@ -20,11 +20,15 @@ differences share the same sign). p = 0.0078 therefore means "all eight runs
 moved in the same direction".
 
 Inputs  : outputs/{exp}_demux/cmp_all/{tool_summary.csv, residual_pattern_summary.csv}
+          (--base-dir / --cmp-subdir select another result tree, e.g. an occurrence rerun)
+          or, with --rescan-csvs, the corrected_internal_RPM column written by
+          rescan_masked_internal.py (one CSV per experiment, or several concatenated).
 Outputs : figures/summary_figures/figure_f_violin/
-            figure_f_paired_internal.{fmt}     paired slopegraph (Suppl. Fig. S2)
-            supplement_f_paired_stats.csv       paired-test statistics table
+            figure_f_paired_internal{_rescan_corrected}.{fmt}   paired slopegraph (Suppl. Fig. S2)
+            supplement_f_paired_stats{_rescan_corrected}.csv     paired-test statistics table
 
 Usage   : python3 barbell_figure_f_paired.py [--plot-format png]
+          python3 barbell_figure_f_paired.py --rescan-csvs rescan/*_rescan_masked_internal.csv
 """
 
 from __future__ import annotations
@@ -48,7 +52,6 @@ except ImportError:
     MATPLOTLIB_AVAILABLE = False
 
 EXPERIMENTS = []
-BASE_DIR = Path("outputs")
 CONDITIONS  = ["c0", "c1", "c2", "c3", "c4", "c5", "c6"]
 COND_LABEL = {
     "c0": "C0 Dorado 1.1.1 raw", "c1": "C1 Dorado 2.0.0 raw",
@@ -62,12 +65,12 @@ def read_csv(path: Path) -> List[Dict[str, str]]:
     return list(csv.DictReader(open(path))) if path.exists() else []
 
 
-def load() -> Tuple[Dict, Dict]:
+def load(base_dir: Path = Path("outputs"), cmp_subdir: str = "cmp_all") -> Tuple[Dict, Dict]:
     """Return total[exp][cond] and internal_rpm[exp][cond]."""
     total: Dict[str, Dict[str, int]] = {}
     internal_rpm: Dict[str, Dict[str, float]] = {}
     for e in EXPERIMENTS:
-        base = BASE_DIR / f"{e}_demux" / "cmp_all"
+        base = base_dir / f"{e}_demux" / cmp_subdir
         tot: Dict[str, int] = {}
         icount: Dict[str, int] = {}
         for r in read_csv(base / "tool_summary.csv"):
@@ -81,6 +84,22 @@ def load() -> Tuple[Dict, Dict]:
             for c in CONDITIONS
         }
     return total, internal_rpm
+
+
+def load_rescan(paths: List[Path]) -> Dict:
+    """internal_rpm[exp][cond] from the corrected_internal_RPM column of rescan_masked_internal.py."""
+    internal_rpm: Dict[str, Dict[str, float]] = {}
+    for path in paths:
+        for r in read_csv(path):
+            internal_rpm.setdefault(r["experiment"], {})[r["tool"]] = float(r["corrected_internal_RPM"])
+    missing_exps = [e for e in EXPERIMENTS if e not in internal_rpm]
+    if missing_exps:
+        raise SystemExit(f"--rescan-csvs lack experiment(s): {', '.join(missing_exps)}")
+    return internal_rpm
+
+
+def has_condition(internal_rpm: Dict, cond: str) -> bool:
+    return all(cond in internal_rpm[e] for e in EXPERIMENTS)
 
 
 def paired_stats(internal_rpm: Dict, a: str, b: str) -> Dict:
@@ -148,19 +167,30 @@ def make_slopegraph(internal_rpm: Dict, out_path: Path, fmt: str) -> None:
 
 
 def main() -> None:
-    global EXPERIMENTS, BASE_DIR
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-dir", type=Path, default=BASE_DIR)
-    ap.add_argument("--experiments", nargs="+", required=True)
     ap.add_argument("--plot-format", default="png", choices=["png", "pdf", "svg"])
     ap.add_argument("--out", type=Path,
                     default=Path("figures/summary_figures/figure_f_violin"))
+    ap.add_argument("--base-dir", type=Path, default=Path("outputs"),
+                    help="Folder holding {experiment}_demux/ (default: outputs)")
+    ap.add_argument("--experiments", nargs="+", required=True,
+                    help="Experiment names")
+    ap.add_argument("--cmp-subdir", default="cmp_all",
+                    help="Comparison folder inside {experiment}_demux/ (default: cmp_all)")
+    ap.add_argument("--rescan-csvs", type=Path, nargs="+", default=None,
+                    help="CSV(s) from rescan_masked_internal.py; recompute the paired tests and "
+                         "fold-changes from corrected_internal_RPM instead of residual_pattern_summary.csv")
     args = ap.parse_args()
-    EXPERIMENTS = args.experiments
-    BASE_DIR = args.base_dir
     args.out.mkdir(parents=True, exist_ok=True)
+    EXPERIMENTS[:] = args.experiments
 
-    _, internal_rpm = load()
+    if args.rescan_csvs:
+        internal_rpm = load_rescan(args.rescan_csvs)
+        suffix = "_rescan_corrected"
+        print(f"Internal rates: corrected_internal_RPM from {len(args.rescan_csvs)} rescan CSV(s)")
+    else:
+        _, internal_rpm = load(args.base_dir, args.cmp_subdir)
+        suffix = ""
 
     comparisons = [
         ("c0", "c2"),  # Dorado 1.1.1 demux effect
@@ -169,9 +199,13 @@ def main() -> None:
         ("c3", "c5"),  # Barbell vs Dorado demux (2.0.0 lineage)  <- headline
         ("c2", "c3"),  # basecaller v5 vs v6 (demux) -> "v6 not better"
     ]
-    rows = [paired_stats(internal_rpm, a, b) for a, b in comparisons]
+    skipped = [(a, b) for a, b in comparisons
+               if not (has_condition(internal_rpm, a) and has_condition(internal_rpm, b))]
+    for a, b in skipped:
+        print(f"  skipping {a}_vs_{b}: condition not in the rescan CSVs")
+    rows = [paired_stats(internal_rpm, a, b) for a, b in comparisons if (a, b) not in skipped]
 
-    stats_path = args.out / "supplement_f_paired_stats.csv"
+    stats_path = args.out / f"supplement_f_paired_stats{suffix}.csv"
     with open(stats_path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
         w.writeheader()
@@ -188,7 +222,7 @@ def main() -> None:
               f"({r['fold_change_min']:.1f}-{r['fold_change_max']:.1f}) "
               f"nAgtB={r['n_experiments_a_gt_b']}/{r['n']} p={r['p_two_sided']:.4g}")
 
-    make_slopegraph(internal_rpm, args.out / f"figure_f_paired_internal.{args.plot_format}",
+    make_slopegraph(internal_rpm, args.out / f"figure_f_paired_internal{suffix}.{args.plot_format}",
                     args.plot_format)
     print("Done.")
 

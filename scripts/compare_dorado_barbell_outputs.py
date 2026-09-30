@@ -28,6 +28,13 @@ Notes:
   - This script uses SQLite internally to avoid keeping all read IDs in RAM.
   - It scans residual barcodes with the same fuzzy logic as your find_barcodes_multi.py:
     up to 1 substitution, 1 insertion, and 1 deletion per barcode sequence.
+  - Two residual-barcode detectors are available (--detector):
+      occurrences (default for new runs): every non-overlapping occurrence within the
+        edit budget is counted (OccurrenceScanner from validate_detector_occurrences.py).
+      best_hit (historical): one regex BESTMATCH search per barcode orientation, so at
+        most one match per pattern: fewest edits, ties to the most 5' copy.
+    residual_count means "retained patterns" under best_hit and "non-overlapping
+    occurrences" under occurrences. The SQLite schema is identical for both.
 """
 
 from __future__ import annotations
@@ -35,12 +42,16 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
+import json
 import math
 import os
+import random
 import re
 import sqlite3
 import statistics
 import subprocess
+import sys
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -63,8 +74,16 @@ except Exception:
 FASTQ_EXTENSIONS = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 BARCODE_RE = re.compile(r"(?:barcode|BC|NB|RBK|RB)(\d{1,3})", re.IGNORECASE)
 
-# Worker-global compiled patterns
+DETECTORS = ("best_hit", "occurrences")
+SCRIPT_DIR = Path(__file__).resolve().parent
+OCCURRENCE_SCANNER_SOURCE = SCRIPT_DIR / "validate_detector_occurrences.py"
+
+# Worker-global detector state
 WORKER_PATTERNS = None
+WORKER_DETECTOR = "best_hit"
+WORKER_SCANNER = None
+WORKER_BARCODE_NAMES: Dict[Tuple[str, str], str] = {}
+WORKER_DECOYS: List[dict] = []
 
 
 def open_maybe_gzip(path: Path, mode: str = "rt"):
@@ -327,9 +346,82 @@ def compile_patterns(barcodes: Sequence[dict], max_sub: int, max_ins: int, max_d
     return compiled
 
 
-def init_worker(barcodes: Sequence[dict], max_sub: int, max_ins: int, max_del: int):
-    global WORKER_PATTERNS
-    WORKER_PATTERNS = compile_patterns(barcodes, max_sub, max_ins, max_del)
+def occurrence_scanner_class():
+    """Import OccurrenceScanner from validate_detector_occurrences.py (same scripts directory)."""
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from validate_detector_occurrences import OccurrenceScanner
+    return OccurrenceScanner
+
+
+def reverse_complement(sequence: str) -> str:
+    return sequence.upper().translate(str.maketrans("ACGTN", "TGCAN"))[::-1]
+
+
+def make_decoy_sets(barcodes: Sequence[dict], n_sets: int, seed: int) -> List[List[dict]]:
+    """N decoy barcode sets: every forward barcode's bases shuffled (composition preserved).
+
+    The backward decoy is the reverse complement of the shuffled forward decoy, so each
+    decoy set keeps the forward/reverse-complement pairing of the real barcode set.
+    Barcodes without a forward entry are shuffled on their own.
+    """
+    generator = random.Random(seed)
+    forward = {bc["barcode_nr"]: bc["sequence"] for bc in barcodes if bc["direction"] == "forward"}
+    sets = []
+    for _ in range(n_sets):
+        shuffled = {}
+        for nr, seq in forward.items():
+            bases = list(seq)
+            generator.shuffle(bases)
+            shuffled[nr] = "".join(bases)
+        decoys = []
+        for bc in barcodes:
+            if bc["barcode_nr"] in shuffled:
+                seq = shuffled[bc["barcode_nr"]]
+                seq = seq if bc["direction"] == "forward" else reverse_complement(seq)
+            else:
+                bases = list(bc["sequence"])
+                generator.shuffle(bases)
+                seq = "".join(bases)
+            decoys.append({**bc, "barcode_name": f"decoy_{bc['barcode_name']}", "sequence": seq})
+        sets.append(decoys)
+    return sets
+
+
+def build_detector(barcodes: Sequence[dict], max_sub: int, max_ins: int, max_del: int, detector: str) -> dict:
+    """Return the per-process state one detector needs: compiled patterns or an OccurrenceScanner."""
+    if detector not in DETECTORS:
+        raise ValueError(f"Unknown detector {detector!r}; choose one of {DETECTORS}")
+    state = {"detector": detector, "patterns": None, "scanner": None, "names": {}}
+    if not barcodes:
+        return state
+    if detector == "best_hit":
+        state["patterns"] = compile_patterns(barcodes, max_sub, max_ins, max_del)
+    else:
+        if not REGEX_AVAILABLE:
+            compile_patterns(barcodes, max_sub, max_ins, max_del)  # raises the dependency message
+        state["scanner"] = occurrence_scanner_class()(barcodes, max_sub, max_ins, max_del)
+        state["names"] = {(bc["barcode_nr"], bc["direction"]): bc["barcode_name"] for bc in barcodes}
+    return state
+
+
+def init_worker(barcodes: Sequence[dict], max_sub: int, max_ins: int, max_del: int,
+                detector: str = "best_hit", decoys: int = 0, decoy_seed: int = 0):
+    """Build the worker-global detector.
+
+    The function default stays best_hit so library callers keep the historical behaviour;
+    the command-line default is occurrences.
+    """
+    global WORKER_PATTERNS, WORKER_DETECTOR, WORKER_SCANNER, WORKER_BARCODE_NAMES, WORKER_DECOYS
+    state = build_detector(barcodes, max_sub, max_ins, max_del, detector)
+    WORKER_DETECTOR = detector
+    WORKER_PATTERNS = state["patterns"]
+    WORKER_SCANNER = state["scanner"]
+    WORKER_BARCODE_NAMES = state["names"]
+    WORKER_DECOYS = [
+        build_detector(decoy_set, max_sub, max_ins, max_del, detector)
+        for decoy_set in (make_decoy_sets(barcodes, decoys, decoy_seed) if barcodes and decoys else [])
+    ]
 
 
 def classify_positions(matches: List[dict], read_length: int, terminal_window: int) -> Tuple[int, int, int, str]:
@@ -376,24 +468,10 @@ def classify_positions(matches: List[dict], read_length: int, terminal_window: i
     return terminal, internal, both_ends, pattern_class
 
 
-def scan_record(seq: str, assigned_bc: str, terminal_window: int) -> dict:
-    global WORKER_PATTERNS
-    if not WORKER_PATTERNS:
-        return {
-            "residual_count": 0,
-            "residual_unique_bc_count": 0,
-            "residual_bcs": "",
-            "residual_details": "",
-            "terminal_residual_count": 0,
-            "internal_residual_count": 0,
-            "both_ends_residual": 0,
-            "pattern_class": "no_residual_scan",
-            "same_as_assigned_residual_count": 0,
-            "different_from_assigned_residual_count": 0,
-        }
+def best_hit_matches(seq: str, patterns: Sequence[dict]) -> List[dict]:
+    """At most one match per barcode orientation: fewest edits, ties to the most 5' copy."""
     matches = []
-    for bc in WORKER_PATTERNS:
-        # Find at most one best match per barcode direction, mirroring the original script.
+    for bc in patterns:
         match = bc["pattern"].search(seq)
         if not match:
             continue
@@ -410,6 +488,49 @@ def scan_record(seq: str, assigned_bc: str, terminal_window: int) -> dict:
             "deletions": dele,
             "matched_sequence": seq[match.start():match.end()],
         })
+    return matches
+
+
+def occurrence_matches(seq: str, scanner, names: Dict[Tuple[str, str], str]) -> List[dict]:
+    """Every non-overlapping occurrence within the edit budget (OccurrenceScanner.scan)."""
+    return [{
+        "barcode_name": names.get((m["barcode_nr"], m["direction"]), m["barcode_nr"]),
+        "barcode_nr": m["barcode_nr"],
+        "direction": m["direction"],
+        "start": m["start"],
+        "end": m["end"],
+        "edit_distance": m["edit_distance"],
+        "substitutions": m["substitutions"],
+        "insertions": m["insertions"],
+        "deletions": m["deletions"],
+        "matched_sequence": seq[m["start"]:m["end"]],
+    } for m in scanner.scan(seq)]
+
+
+def detector_matches(seq: str, state: dict) -> List[dict]:
+    if state["detector"] == "occurrences":
+        return occurrence_matches(seq, state["scanner"], state["names"])
+    return best_hit_matches(seq, state["patterns"])
+
+
+def scan_record(seq: str, assigned_bc: str, terminal_window: int) -> dict:
+    if not (WORKER_PATTERNS or WORKER_SCANNER):
+        return {
+            "residual_count": 0,
+            "residual_unique_bc_count": 0,
+            "residual_bcs": "",
+            "residual_details": "",
+            "terminal_residual_count": 0,
+            "internal_residual_count": 0,
+            "both_ends_residual": 0,
+            "pattern_class": "no_residual_scan",
+            "same_as_assigned_residual_count": 0,
+            "different_from_assigned_residual_count": 0,
+        }
+    if WORKER_DETECTOR == "occurrences":
+        matches = occurrence_matches(seq, WORKER_SCANNER, WORKER_BARCODE_NAMES)
+    else:
+        matches = best_hit_matches(seq, WORKER_PATTERNS)
 
     terminal, internal, both_ends, pattern_class = classify_positions(matches, len(seq), terminal_window)
     residual_bcs = ";".join(sorted({m["barcode_nr"] for m in matches})) if matches else ""
@@ -439,6 +560,25 @@ def scan_record(seq: str, assigned_bc: str, terminal_window: int) -> dict:
     }
 
 
+def location_class(pattern_class: str) -> str:
+    """Location suffix of a pattern_class: internal, both_ends, terminal or none."""
+    for suffix in ("internal", "both_ends", "terminal"):
+        if pattern_class.endswith("__" + suffix):
+            return suffix
+    return "none"
+
+
+def decoy_tally(seq: str, terminal_window: int, counts: List[Dict[str, int]]) -> None:
+    """Add one read's decoy location classes to per-decoy-set counters."""
+    for state, tally in zip(WORKER_DECOYS, counts):
+        matches = detector_matches(seq, state)
+        tally["reads"] += 1
+        if matches:
+            _, _, _, pattern_class = classify_positions(matches, len(seq), terminal_window)
+            tally["positive"] += 1
+            tally[location_class(pattern_class)] += 1
+
+
 def _count_fastq_records(path: Path) -> int:
     """Count records in a FASTQ file by counting newlines in binary mode (÷ 4)."""
     with open_maybe_gzip(path, "rb") as f:
@@ -446,20 +586,24 @@ def _count_fastq_records(path: Path) -> int:
     return max(n_lines // 4, 0)
 
 
-def process_fastq_range(args) -> List[tuple]:
+def process_fastq_range(args) -> Tuple[List[tuple], List[Counter]]:
     """Worker processes records [skip_n, skip_n + take_n) from a FASTQ file.
+
+    Returns the read rows and one location counter per decoy set (empty without --decoys).
 
     Workers for later chunks re-read skipped records but those are served from
     the OS page cache (RAM speed) after the first worker warms it up.
     """
     tool, file_path, assigned_bc, terminal_window, skip_n, take_n = args
     reader = fastq_reader(Path(file_path))
+    decoy_counts = [Counter(reads=0, positive=0, internal=0, both_ends=0, terminal=0)
+                    for _ in WORKER_DECOYS]
     # Skip first skip_n records without processing (no scan_record overhead)
     for _ in range(skip_n):
         try:
             next(reader)
         except StopIteration:
-            return []
+            return [], decoy_counts
     rows = []
     count = 0
     for header, seq, plus, qual in reader:
@@ -469,6 +613,8 @@ def process_fastq_range(args) -> List[tuple]:
         length = len(seq)
         q = mean_qscore(qual)
         scan = scan_record(seq, assigned_bc, terminal_window)
+        if WORKER_DECOYS:
+            decoy_tally(seq, terminal_window, decoy_counts)
         rows.append((
             tool, rid, assigned_bc, file_path, length, q,
             scan["residual_count"], scan["residual_unique_bc_count"],
@@ -479,7 +625,7 @@ def process_fastq_range(args) -> List[tuple]:
             scan["different_from_assigned_residual_count"],
         ))
         count += 1
-    return rows
+    return rows, decoy_counts
 
 
 def connect_db(db_path: Path) -> sqlite3.Connection:
@@ -554,6 +700,10 @@ def load_tool_outputs(
     terminal_window: int,
     threads: int,
     chunk_size: int,
+    detector: str = "best_hit",
+    decoys: int = 0,
+    decoy_seed: int = 0,
+    decoy_dir: Optional[Path] = None,
 ):
     already_done = con.execute(
         "SELECT 1 FROM completed_tools WHERE tool=?", (tool,)
@@ -588,14 +738,17 @@ def load_tool_outputs(
     print(f"[{tool}] Work items: {len(work)} (chunk_size={chunk_size:,}, files={len(files_sorted)})")
 
     total_inserted = 0
+    decoy_totals = [Counter() for _ in range(decoys if barcodes else 0)]
     with ProcessPoolExecutor(
         max_workers=threads,
         initializer=init_worker,
-        initargs=(barcodes, max_sub, max_ins, max_del),
+        initargs=(barcodes, max_sub, max_ins, max_del, detector, decoys, decoy_seed),
     ) as ex:
         futures = {ex.submit(process_fastq_range, w): (w[1], w[4]) for w in work}
         for i, fut in enumerate(as_completed(futures), 1):
-            rows = fut.result()
+            rows, decoy_counts = fut.result()
+            for total, counts in zip(decoy_totals, decoy_counts):
+                total.update(counts)
             insert_read_rows(con, rows)
             total_inserted += len(rows)
             con.commit()
@@ -604,6 +757,12 @@ def load_tool_outputs(
             print(f"[{tool}] chunks done: {i}/{len(work)} ({fname}+{skip:,}, {len(rows):,} reads) | total: {total_inserted:,}")
 
     print(f"[{tool}] total reads inserted: {total_inserted}")
+    if decoy_totals and decoy_dir is not None:
+        # Decoy tallies live beside the database, so the SQLite schema is unchanged.
+        decoy_dir.mkdir(parents=True, exist_ok=True)
+        (decoy_dir / f"{tool}.json").write_text(json.dumps(
+            {"tool": tool, "decoys": decoys, "decoy_seed": decoy_seed, "detector": detector,
+             "sets": [dict(total) for total in decoy_totals]}, indent=2) + "\n")
     con.execute("INSERT OR REPLACE INTO completed_tools VALUES (?)", (tool,))
     con.commit()
 
@@ -773,6 +932,127 @@ def write_stat_tests(con: sqlite3.Connection, out_dir: Path):
         writer.writerows(tests)
 
 
+PROVENANCE_FILE = "detector_provenance.json"
+DECOY_DIR = "decoy_counts"
+RESIDUAL_COUNT_MEANING = {
+    "best_hit": "retained barcode-orientation patterns per read (at most one per barcode orientation)",
+    "occurrences": "non-overlapping barcode occurrences per read",
+}
+MATCH_SELECTION = {
+    "best_hit": ("one regex BESTMATCH search per barcode orientation: fewest edits, "
+                 "ties to the most 5' copy; further copies of that orientation are not counted"),
+    "occurrences": ("all candidate spans of 23-25 nt within the edit budget (exact 6 nt seeds, "
+                    "fullmatch check), overlaps resolved greedily by edit distance, |length - 24|, "
+                    "start, end, barcode_nr, direction; adjacent matches are kept"),
+}
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def detector_provenance(detector: str, has_barcodes: bool, max_sub: int, max_ins: int, max_del: int,
+                        terminal_window: int, decoys: int, decoy_seed: int) -> dict:
+    """How this output directory's residual-barcode columns were produced."""
+    script = Path(__file__).resolve()
+    scanner_source = OCCURRENCE_SCANNER_SOURCE if detector == "occurrences" else script
+    return {
+        "detector": detector if has_barcodes else "none (no --barcode-csv)",
+        "scanner_source": scanner_source.name,
+        "scanner_sha256": file_sha256(scanner_source),
+        "production_script_sha256": file_sha256(script),
+        "regex_version": getattr(regex, "__version__", "unavailable") if REGEX_AVAILABLE else "unavailable",
+        "edit_budget": {"max_substitutions": max_sub, "max_insertions": max_ins, "max_deletions": max_del},
+        "terminal_window": terminal_window,
+        "match_selection": MATCH_SELECTION[detector],
+        "residual_count_meaning": RESIDUAL_COUNT_MEANING[detector],
+        "decoys": decoys,
+        "decoy_seed": decoy_seed if decoys else None,
+    }
+
+
+def check_resume_provenance(con: sqlite3.Connection, out_dir: Path, provenance: dict) -> None:
+    """Refuse to resume a database with a different detector, edit budget or window."""
+    path = out_dir / PROVENANCE_FILE
+    has_rows = con.execute("SELECT 1 FROM reads LIMIT 1").fetchone() is not None
+    if path.exists():
+        previous = json.loads(path.read_text())
+    elif has_rows:
+        # Databases written before provenance recording were all produced by best_hit.
+        previous = {"detector": "best_hit", "edit_budget": provenance["edit_budget"],
+                    "terminal_window": provenance["terminal_window"]}
+        print(f"[db] no {PROVENANCE_FILE}; existing rows are assumed to come from the best_hit detector")
+    else:
+        return
+    for key in ("detector", "edit_budget", "terminal_window"):
+        if has_rows and previous.get(key) != provenance[key]:
+            raise SystemExit(
+                f"Existing database in {out_dir} was produced with {key}={previous.get(key)!r}, "
+                f"but this run requests {key}={provenance[key]!r}.\n"
+                "Choose a new --out folder so the two detectors are not mixed in one database."
+            )
+    if has_rows and previous.get("production_script_sha256") not in (None, provenance["production_script_sha256"]):
+        print("[db] WARNING: resuming a database written by a different scanner script version")
+
+
+def provenance_report_lines(provenance: Optional[dict]) -> List[str]:
+    if not provenance:
+        return []
+    budget = provenance["edit_budget"]
+    lines = [
+        "\n## Residual barcode detector\n",
+        f"- Detector: `{provenance['detector']}`\n",
+        f"- Scanner source: `{provenance['scanner_source']}` (SHA-256 `{provenance['scanner_sha256']}`)\n",
+        f"- Production script SHA-256: `{provenance['production_script_sha256']}`\n",
+        f"- regex package: {provenance['regex_version']}\n",
+        f"- Edit budget per barcode: <= {budget['max_substitutions']} substitution(s), "
+        f"<= {budget['max_insertions']} insertion(s), <= {budget['max_deletions']} deletion(s)\n",
+        f"- Terminal window: {provenance['terminal_window']} bp\n",
+        f"- Match selection: {provenance['match_selection']}\n",
+        f"- `residual_count` counts {provenance['residual_count_meaning']}\n",
+    ]
+    if provenance.get("decoys"):
+        lines.append(f"- Decoy background: {provenance['decoys']} shuffled barcode set(s), "
+                     f"seed {provenance['decoy_seed']} (see `decoy_background.csv`)\n")
+    return lines
+
+
+def write_decoy_background(con: sqlite3.Connection, out_dir: Path, tools: Sequence[str]) -> None:
+    """Decoy internal/terminal/both-ends RPM next to the real rates, one row per tool and decoy set."""
+    real: Dict[str, Counter] = defaultdict(Counter)
+    for tool, pattern_class, n in con.execute(
+            "SELECT tool, pattern_class, COUNT(*) FROM reads GROUP BY tool, pattern_class"):
+        real[tool]["reads"] += n
+        real[tool][location_class(pattern_class)] += n
+    rows = []
+    for tool in tools:
+        path = out_dir / DECOY_DIR / f"{tool}.json"
+        if not path.exists():
+            print(f"[{tool}] WARNING: no decoy counts ({path}); tool was loaded without --decoys")
+            continue
+        total = real[tool]["reads"]
+        rpm = (lambda n: 1e6 * n / total if total else float("nan"))
+        for index, counts in enumerate(json.loads(path.read_text())["sets"], 1):
+            rows.append({
+                "tool": tool, "decoy_set": index, "total_reads": total,
+                "decoy_positive_reads": counts.get("positive", 0),
+                "decoy_internal_reads": counts.get("internal", 0),
+                "decoy_internal_RPM": rpm(counts.get("internal", 0)),
+                "decoy_terminal_reads": counts.get("terminal", 0),
+                "decoy_terminal_RPM": rpm(counts.get("terminal", 0)),
+                "decoy_both_ends_reads": counts.get("both_ends", 0),
+                "decoy_both_ends_RPM": rpm(counts.get("both_ends", 0)),
+                "real_internal_RPM": rpm(real[tool]["internal"]),
+                "real_terminal_RPM": rpm(real[tool]["terminal"]),
+                "real_both_ends_RPM": rpm(real[tool]["both_ends"]),
+            })
+    if rows:
+        with open(out_dir / "decoy_background.csv", "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+
 def write_outputs(
     con: sqlite3.Connection,
     out_dir: Path,
@@ -780,6 +1060,7 @@ def write_outputs(
     barbell_dir: Optional[Path] = None,
     raw_fastq: Optional[Path] = None,
     condition_names: Optional[List[str]] = None,
+    provenance: Optional[dict] = None,
 ):
     """Write all output CSVs and the markdown report.
 
@@ -972,14 +1253,18 @@ def write_outputs(
             """)
 
     write_stat_tests(con, out_dir)
+    if provenance and provenance.get("decoys"):
+        write_decoy_background(con, out_dir, condition_names or [])
     if multi_condition:
-        write_markdown_report_multi(con, out_dir, condition_names=condition_names or [])
+        write_markdown_report_multi(con, out_dir, condition_names=condition_names or [],
+                                    provenance=provenance)
     else:
         write_markdown_report(
             con, out_dir,
             dorado_dir=dorado_dir,
             barbell_dir=barbell_dir,
             raw_fastq=raw_fastq,
+            provenance=provenance,
         )
 
 
@@ -1007,6 +1292,7 @@ def write_markdown_report_multi(
     out_dir: Path,
     *,
     condition_names: List[str],
+    provenance: Optional[dict] = None,
 ):
     """Simplified per-condition markdown report for multi-condition (N > 2) mode."""
     rows = con.execute("""
@@ -1032,6 +1318,7 @@ def write_markdown_report_multi(
     report.append("\n## Conditions\n")
     for name in condition_names:
         report.append(f"- `{name}`\n")
+    report.extend(provenance_report_lines(provenance))
 
     report.append("\n## Output files\n")
     for name in [
@@ -1043,6 +1330,8 @@ def write_markdown_report_multi(
         "qscore_distribution_bins.csv",
         "example_problematic_reads.csv",
         "hypothesis_tests.csv",
+        "decoy_background.csv",
+        PROVENANCE_FILE,
     ]:
         if (out_dir / name).exists():
             report.append(f"- `{name}`\n")
@@ -1058,6 +1347,7 @@ def write_markdown_report(
     dorado_dir: Optional[Path] = None,
     barbell_dir: Optional[Path] = None,
     raw_fastq: Optional[Path] = None,
+    provenance: Optional[dict] = None,
 ):
     d_total = fetch_scalar(con, "SELECT COUNT(*) FROM reads WHERE tool='dorado'")
     b_total = fetch_scalar(con, "SELECT COUNT(*) FROM reads WHERE tool='barbell'")
@@ -1106,6 +1396,8 @@ def write_markdown_report(
     report.append(f"- Dorado reads with multiple different residual barcodes: {d_multi:,} ({100*d_multi/max(d_total,1):.4f}%)\n")
     report.append(f"- Barbell reads with multiple different residual barcodes: {b_multi:,} ({100*b_multi/max(b_total,1):.4f}%)\n")
 
+    report.extend(provenance_report_lines(provenance))
+
     report.append("\n## NanoStat QC outputs\n")
     for label, nanostat_dir in [
         ("raw reads",    raw_fastq.parent / "nanostat" if raw_fastq else None),
@@ -1144,6 +1436,8 @@ def write_markdown_report(
         "example_problematic_reads.csv",
         "hypothesis_tests.csv",
         "raw_retention_summary.csv",
+        "decoy_background.csv",
+        PROVENANCE_FILE,
     ]:
         if (out_dir / name).exists():
             report.append(f"- `{name}`\n")
@@ -1152,7 +1446,15 @@ def write_markdown_report(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Compare Dorado and Barbell FASTQ demultiplexing outputs, or aggregate stats across N conditions.")
+    ap = argparse.ArgumentParser(
+        description=(
+            "Compare Dorado and Barbell FASTQ demultiplexing outputs, or aggregate stats across N conditions. "
+            "Residual barcodes are detected with --detector occurrences by default (every non-overlapping "
+            "occurrence within the edit budget). Runs made before this option existed used best_hit "
+            "(one match per barcode orientation: fewest edits, ties to the most 5' copy); pass "
+            "--detector best_hit to reproduce them."
+        ),
+    )
     # ── Multi-condition mode (new) ────────────────────────────────────────────
     ap.add_argument("--condition-dirs",  nargs="+", type=Path, default=None,
                     help="N condition directories (one per condition). Replaces --dorado-dir/--barbell-dir for multi-condition mode.")
@@ -1173,6 +1475,15 @@ def main():
     ap.add_argument("--max-substitutions", type=int, default=1)
     ap.add_argument("--max-insertions",    type=int, default=1)
     ap.add_argument("--max-deletions",     type=int, default=1)
+    ap.add_argument("--detector", choices=DETECTORS, default="occurrences",
+                    help="Residual-barcode detector. occurrences (new default): every non-overlapping "
+                         "occurrence within the edit budget; residual_count = occurrences. best_hit "
+                         "(historical default): one regex BESTMATCH match per barcode orientation, fewest "
+                         "edits, ties to the most 5' copy; residual_count = retained patterns. Default: occurrences.")
+    ap.add_argument("--decoys", type=int, default=0,
+                    help="Also scan every read against N decoy barcode sets (each barcode's bases shuffled, "
+                         "composition preserved) and write decoy_background.csv. Multiplies scan time. Default: 0.")
+    ap.add_argument("--decoy-seed", type=int, default=20260929, help="Seed for the decoy shuffles (default: 20260929)")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--nanostat",          default="NanoStat")
     ap.add_argument("--minimap2",          default="minimap2")
@@ -1208,6 +1519,19 @@ def main():
     else:
         barcodes = []
         print("No --barcode-csv provided: residual barcode scanning will be skipped.")
+    if args.decoys < 0:
+        ap.error("--decoys must be >= 0")
+    if barcodes:
+        try:
+            build_detector(barcodes, args.max_substitutions, args.max_insertions, args.max_deletions,
+                           args.detector)
+        except ValueError as exc:
+            raise SystemExit(f"Cannot build the {args.detector} detector: {exc}")
+    provenance = detector_provenance(
+        args.detector, bool(barcodes), args.max_substitutions, args.max_insertions,
+        args.max_deletions, args.terminal_window, args.decoys if barcodes else 0, args.decoy_seed,
+    )
+    print(f"Residual barcode detector: {provenance['detector']}")
     print(f"Scipy available for p-values: {SCIPY_AVAILABLE}")
     print(f"Mode: {'multi-condition (' + str(len(conditions)) + ' conditions)' if multi_condition else 'legacy dorado-vs-barbell'}")
 
@@ -1238,6 +1562,8 @@ def main():
 
     con = connect_db(db_path)
     init_db(con)
+    check_resume_provenance(con, args.out, provenance)
+    (args.out / PROVENANCE_FILE).write_text(json.dumps(provenance, indent=2) + "\n")
 
     condition_names_loaded = [
         row[0] for row in con.execute("SELECT tool FROM completed_tools").fetchall()
@@ -1261,6 +1587,8 @@ def main():
             con, name, path, barcodes,
             args.max_substitutions, args.max_insertions, args.max_deletions,
             args.terminal_window, args.threads, args.chunk_size,
+            detector=args.detector, decoys=provenance["decoys"], decoy_seed=args.decoy_seed,
+            decoy_dir=args.out / DECOY_DIR,
         )
 
     if not multi_condition:
@@ -1288,6 +1616,7 @@ def main():
         barbell_dir=args.barbell_dir if not multi_condition else None,
         raw_fastq=args.raw_fastq if not multi_condition else None,
         condition_names=[name for name, _ in conditions],
+        provenance=provenance,
     )
     con.close()
 

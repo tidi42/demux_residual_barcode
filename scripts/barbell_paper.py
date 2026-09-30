@@ -452,6 +452,7 @@ def run_compare_all(
     skip_nanostat: bool = False,
     skip_barcode_scan: bool = False,
     python: Path | None = None,
+    detector: str = "occurrences",
 ) -> None:
     """Run compare_dorado_barbell_outputs.py for all N conditions at once."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -466,7 +467,7 @@ def run_compare_all(
         "--overwrite",
     ]
     if barcode_csv is not None:
-        cmd += ["--barcode-csv", str(barcode_csv)]
+        cmd += ["--barcode-csv", str(barcode_csv), "--detector", detector]
     if skip_nanostat:
         cmd.append("--skip-nanostat")
     if skip_barcode_scan:
@@ -568,6 +569,9 @@ def parse_args() -> argparse.Namespace:
                     help="Passed to compare_dorado_barbell_outputs.py: skip NanoStat QC")
     ap.add_argument("--skip-barcode-scan", action="store_true",
                     help="Passed to compare_dorado_barbell_outputs.py: skip minimap2 residual barcode scan")
+    ap.add_argument("--detector", choices=["best_hit", "occurrences"], default="occurrences",
+                    help="Passed to compare_dorado_barbell_outputs.py: residual-barcode detector "
+                         "(default: occurrences; best_hit reproduces runs made before this option)")
 
     return ap.parse_args()
 
@@ -720,6 +724,7 @@ def main() -> None:
             skip_nanostat=args.skip_nanostat,
             skip_barcode_scan=args.skip_barcode_scan,
             python=args.python,
+            detector=args.detector,
         )
     else:
         log.info("[CMP_ALL] Skipped.")
